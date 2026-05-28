@@ -14,7 +14,7 @@ This project provides an out-of-tree MLIR dialect designed for precision tuning.
 
 ### Prerequisites
 
-- LLVM and MLIR (Compile from source using these [compile flags](llvm_compile_flags.txt) and [commit id](https://github.com/llvm/llvm-project/commit/3f37df5b711773bfd962b703b6d4178e6d16c076))
+- LLVM and MLIR (Compile from source using these [compile flags](llvm_compile_flags.txt) and [commit id](llvm_commit.txt))
 - CMake
 - Ninja (optional, but recommended)
 
