@@ -2,6 +2,23 @@
 #define TAFFO_TRANSFORMS_PASSES_TD
 
 include "mlir/Pass/PassBase.td"
+include "flang/Optimizer/Dialect/FIRDialect.td"
+
+def FIRToMlirPass
+    : Pass<"fir-to-mlir">
+{
+    let summary = "Convert FIR to intree MLIR dialects";
+
+    let description = [{
+        Raise scf and Arith ops generated from Polygeist to Taffo dialect.
+    }];
+
+    let dependentDialects = [
+        "fir::FIROpsDialect",
+        "mlir::scf::SCFDialect",
+        "mlir::memref::MemRefDialect"
+    ];
+}
 
 def RaiseToTaffoPass
     : Pass<"raise-to-taffo">

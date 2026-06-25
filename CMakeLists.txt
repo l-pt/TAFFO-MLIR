@@ -21,10 +21,13 @@ if (DEFINED LLVM_PATH)
   set(LLVM_DIR "${LLVM_ABS_PATH}/lib/cmake/llvm")
   set(MLIR_DIR "${LLVM_ABS_PATH}/lib/cmake/mlir")
   set(Clang_DIR "${LLVM_ABS_PATH}/lib/cmake/clang")
+  set(Flang_DIR "${LLVM_ABS_PATH}/lib/cmake/flang")
 endif()
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)
+find_package(Clang REQUIRED CONFIG)
+find_package(Flang REQUIRED CONFIG)
 
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
