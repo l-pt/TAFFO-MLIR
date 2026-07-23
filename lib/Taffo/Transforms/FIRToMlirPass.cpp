@@ -18,7 +18,6 @@
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/Support/LogicalResult.h"
 
 namespace mlir::taffo {
 #define GEN_PASS_DEF_FIRTOMLIRPASS
@@ -33,15 +32,15 @@ class FIRToMlirPass
 public:
   using FIRToMlirPassBase::FIRToMlirPassBase;
 
-  class FIRToMlirTypeConverter : public mlir::TypeConverter {
-    static mlir::IntegerType::SignednessSemantics getSignednessSemantic(mlir::Type type) {
+  class FIRToMlirTypeConverter : public TypeConverter {
+    static IntegerType::SignednessSemantics getSignednessSemantic(Type type) {
       if (type.isSignedInteger()) {
-        return mlir::IntegerType::SignednessSemantics::Signed;
+        return IntegerType::SignednessSemantics::Signed;
       }
       if (type.isUnsignedInteger()) {
-        return mlir::IntegerType::SignednessSemantics::Unsigned;
+        return IntegerType::SignednessSemantics::Unsigned;
       }
-      return mlir::IntegerType::SignednessSemantics::Signless;
+      return IntegerType::SignednessSemantics::Signless;
     }
 
   public:
@@ -49,10 +48,10 @@ public:
       addConversion([](Type type) { return type; });
 
       addConversion([&ctx](fir::IntegerType type) {
-          return mlir::IntegerType::get(&ctx, type.getIntOrFloatBitWidth(), getSignednessSemantic(type));
+          return IntegerType::get(&ctx, type.getIntOrFloatBitWidth(), getSignednessSemantic(type));
       });
       addConversion([&ctx, &op](fir::LogicalType type) {
-          return mlir::IntegerType::get(&ctx, fir::getKindMapping(&op).getLogicalBitsize(type.getFKind()));
+          return IntegerType::get(&ctx, fir::getKindMapping(&op).getLogicalBitsize(type.getFKind()));
       });
       //TODO convert memref types
     }
@@ -79,8 +78,8 @@ public:
     LogicalResult matchAndRewrite(fir::DoLoopOp firDoLoopOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firDoLoopOp.getLoc(), rewriter);
 
-      mlir::Value firLb = firDoLoopOp.getLowerBound();
-      mlir::Value firUb = firDoLoopOp.getUpperBound();
+      Value firLb = firDoLoopOp.getLowerBound();
+      Value firUb = firDoLoopOp.getUpperBound();
 
       //If the step is negative, swap lower and upper bound and use -step
       auto zeroConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(0)); //TODO check if we need different types
@@ -106,7 +105,7 @@ public:
       rewriter.mergeBlocks(firDoLoopOp.getBody(), forOp.getBody(), {selectNewIv.getResult()});
 
       //Replace fir.result with scf.yield
-      mlir::Operation *firResultOp = forOp.getBody()->getTerminator();
+      Operation* firResultOp = forOp.getBody()->getTerminator();
       rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
 
       rewriter.replaceOp(firDoLoopOp, forOp);
@@ -126,15 +125,15 @@ public:
       //NOTE each block is terminated by a fir.result op, we have to convert it in a scf.yield op.
       //See: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfyield-scfyieldop
       //See: https://flang.llvm.org/docs/FIRLangRef.html#fir-result-fir-resultop
-      mlir::Region& thenRegion = ifOp.getThenRegion();
+      Region& thenRegion = ifOp.getThenRegion();
       thenRegion.takeBody(firIfOp.getThenRegion());
-      mlir::Operation *firResultOp = thenRegion.front().getTerminator();
+      Operation *firResultOp = thenRegion.front().getTerminator();
       rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
 
       if (hasElse) {
-        mlir::Region& elseRegion = ifOp.getElseRegion();
+        Region& elseRegion = ifOp.getElseRegion();
         elseRegion.takeBody(firIfOp.getElseRegion());
-        mlir::Operation *firResultOp = elseRegion.front().getTerminator();
+        Operation *firResultOp = elseRegion.front().getTerminator();
         rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
       }
 
