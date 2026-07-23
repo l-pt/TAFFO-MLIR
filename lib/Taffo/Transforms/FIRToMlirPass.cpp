@@ -79,17 +79,36 @@ public:
     LogicalResult matchAndRewrite(fir::DoLoopOp firDoLoopOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firDoLoopOp.getLoc(), rewriter);
 
-      //TODO handle negative step
-      //auto zeroConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(0));
-      //auto cmpWithZero = builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, firDoLoopOp.getStep(), zeroConst);
+      mlir::Value firLb = firDoLoopOp.getLowerBound();
+      mlir::Value firUb = firDoLoopOp.getUpperBound();
+
+      //If the step is negative, swap lower and upper bound and use -step
+      auto zeroConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(0)); //TODO check if we need different types
+      auto isStepPositive = builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, firDoLoopOp.getStep(), zeroConst);
+      auto selectLowerBound = builder.create<arith::SelectOp>(isStepPositive.getResult(), firLb, firUb);
+      auto selectUpperBound = builder.create<arith::SelectOp>(isStepPositive.getResult(), firUb, firLb);
+      auto negStep = builder.create<arith::SubIOp>(zeroConst, firDoLoopOp.getStep());
+      auto selectStep = builder.create<arith::SelectOp>(isStepPositive.getResult(), firDoLoopOp.getStep(), negStep.getResult());
 
       //NOTE: fir.do_loop has inclusive upper bound, scf.for does not
-      auto oneConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(1));
-      auto realUpperBound = builder.create<arith::AddIOp>(firDoLoopOp.getUpperBound(), oneConst);
-      auto forOp = builder.create<scf::ForOp>(firDoLoopOp.getLowerBound(),
+      auto realUpperBound = builder.create<arith::AddIOp>(selectUpperBound.getResult(), selectStep.getResult());
+      auto forOp = builder.create<scf::ForOp>(selectLowerBound.getResult(),
           realUpperBound.getResult(),
-          firDoLoopOp.getStep(),
+          selectStep.getResult(),
           firDoLoopOp.getInitArgs());
+
+      //Move the loop body, replace induction variable if necessary
+      //delta = for_iv - original_lb
+      //new_iv = original_ub - delta
+      auto delta = builder.create<arith::SubIOp>(forOp.getInductionVar(), firLb);
+      auto newIv = builder.create<arith::SubIOp>(firUb, delta.getResult());
+      auto selectNewIv = builder.create<arith::SelectOp>(isStepPositive.getResult(), forOp.getInductionVar(), newIv.getResult());
+      rewriter.mergeBlocks(firDoLoopOp.getBody(), forOp.getBody(), {selectNewIv.getResult()});
+
+      //Replace fir.result with scf.yield
+      mlir::Operation *firResultOp = forOp.getBody()->getTerminator();
+      rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
+
       rewriter.replaceOp(firDoLoopOp, forOp);
       return success();
     }
