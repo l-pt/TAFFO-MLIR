@@ -70,6 +70,31 @@ public:
     }
   };
 
+  //Convert fir.do_loop in scf.for
+  struct RewriteDoLoop : public OpConversionPattern<fir::DoLoopOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    //See: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scffor-scfforop
+    //See: https://flang.llvm.org/docs/FIRLangRef.html#fir-do-loop-fir-doloopop
+    LogicalResult matchAndRewrite(fir::DoLoopOp firDoLoopOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      ImplicitLocOpBuilder builder(firDoLoopOp.getLoc(), rewriter);
+
+      //TODO handle negative step
+      //auto zeroConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(0));
+      //auto cmpWithZero = builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, firDoLoopOp.getStep(), zeroConst);
+
+      //NOTE: fir.do_loop has inclusive upper bound, scf.for does not
+      auto oneConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(1));
+      auto realUpperBound = builder.create<arith::AddIOp>(firDoLoopOp.getUpperBound(), oneConst);
+      auto forOp = builder.create<scf::ForOp>(firDoLoopOp.getLowerBound(),
+          realUpperBound.getResult(),
+          firDoLoopOp.getStep(),
+          firDoLoopOp.getInitArgs());
+      rewriter.replaceOp(firDoLoopOp, forOp);
+      return success();
+    }
+  };
+
   struct RewriteIf : public OpConversionPattern<fir::IfOp> {
     using OpConversionPattern::OpConversionPattern;
 
@@ -112,6 +137,7 @@ public:
     RewritePatternSet patternSet(&context);
     patternSet.add<RewriteAlloca>(typeConverter, &context);
     patternSet.add<RewriteIf>(typeConverter, &context);
+    patternSet.add<RewriteDoLoop>(typeConverter, &context);
 
     (void) applyFullConversion(op, target, std::move(patternSet));
   }
