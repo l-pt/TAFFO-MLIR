@@ -1,3 +1,4 @@
+#include "flang/Optimizer/Dialect/FIRDialect.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/InitAllDialects.h"
@@ -20,6 +21,7 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   registry.insert<mlir::taffo::TaffoDialect>();
+  registry.insert<fir::FIROpsDialect>();
 
   mlir::taffo::registerTaffoPasses();
 
