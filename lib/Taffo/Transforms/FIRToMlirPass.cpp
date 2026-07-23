@@ -17,8 +17,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LLVM.h"
-#include "llvm/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/Support/LogicalResult.h"
 
 namespace mlir::taffo {
 #define GEN_PASS_DEF_FIRTOMLIRPASS
@@ -62,13 +62,39 @@ public:
     using OpConversionPattern::OpConversionPattern;
 
     LogicalResult matchAndRewrite(fir::AllocaOp firAllocaOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
-      rewriter.startOpModification(firAllocaOp);
-
       ImplicitLocOpBuilder builder(firAllocaOp.getLoc(), rewriter);
       //TODO convert memref types
-      auto memrefAllocaOp = builder.create<memref::AllocaOp>();
-
+      auto memrefAllocaOp = builder.create<memref::AllocaOp>(MemRefType::get({}, firAllocaOp.getAllocatedType()));
       rewriter.replaceOp(firAllocaOp, memrefAllocaOp);
+      return success();
+    }
+  };
+
+  struct RewriteIf : public OpConversionPattern<fir::IfOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(fir::IfOp firIfOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      ImplicitLocOpBuilder builder(firIfOp.getLoc(), rewriter);
+
+      bool hasElse = !firIfOp.getElseRegion().empty();
+      auto ifOp = builder.create<scf::IfOp>(firIfOp.getResultTypes(), firIfOp.getCondition(), hasElse);
+
+      //NOTE each block is terminated by a fir.result op, we have to convert it in a scf.yield op.
+      //See: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfyield-scfyieldop
+      //See: https://flang.llvm.org/docs/FIRLangRef.html#fir-result-fir-resultop
+      mlir::Region& thenRegion = ifOp.getThenRegion();
+      thenRegion.takeBody(firIfOp.getThenRegion());
+      mlir::Operation *firResultOp = thenRegion.front().getTerminator();
+      rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
+
+      if (hasElse) {
+        mlir::Region& elseRegion = ifOp.getElseRegion();
+        elseRegion.takeBody(firIfOp.getElseRegion());
+        mlir::Operation *firResultOp = elseRegion.front().getTerminator();
+        rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
+      }
+
+      rewriter.replaceOp(firIfOp, ifOp);
       return success();
     }
   };
@@ -84,7 +110,8 @@ public:
     FIRToMlirTypeConverter typeConverter(context, *op);
 
     RewritePatternSet patternSet(&context);
-    patternSet.add<RewriteAlloca>(typeConverter, context);
+    patternSet.add<RewriteAlloca>(typeConverter, &context);
+    patternSet.add<RewriteIf>(typeConverter, &context);
 
     (void) applyFullConversion(op, target, std::move(patternSet));
   }
