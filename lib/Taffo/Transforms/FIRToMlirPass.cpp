@@ -24,10 +24,8 @@
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/Support/LogicalResult.h"
 #include <cstdlib>
 #include <iostream>
-#include <ostream>
 
 namespace mlir::taffo {
 #define GEN_PASS_DEF_FIRTOMLIRPASS
@@ -71,14 +69,18 @@ public:
         if (inputs.size() != 1) {
           return {};
         }
-        return builder.create<memref::CastOp>(loc, resultType, inputs).getResult();
+        auto castToRealOp = builder.create<mlir::UnrealizedConversionCastOp>(loc, resultType, inputs);
+        return castToRealOp.getResult(0);
       });
 
-      addTargetMaterialization([](OpBuilder& builder, Type resultType, ValueRange inputs, Location loc) -> Value {
+      addTargetMaterialization([](OpBuilder& builder, TypeRange resultType, ValueRange inputs, Location loc) -> SmallVector<Value> {
         if (inputs.size() != 1) {
           return {};
         }
-        return builder.create<memref::CastOp>(loc, resultType, inputs).getResult();
+        auto castToRealOp = builder.create<mlir::UnrealizedConversionCastOp>(loc, resultType, inputs);
+        SmallVector<Value> result;
+        result.push_back(castToRealOp.getResult(0));
+        return result;
       });
     }
   };
@@ -86,7 +88,7 @@ public:
   static SmallVector<Type> convTypes(const TypeConverter* converter, TypeRange in) {
     SmallVector<Type> out;
     if (failed(converter->convertTypes(in, out))) {
-      std::cerr << "conversion error" << std::endl;
+      std::cerr << "conversion error\n";
       std::abort();
     }
     return out;
@@ -119,7 +121,7 @@ public:
 
     LogicalResult matchAndRewrite(fir::LoadOp firLoadOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firLoadOp.getLoc(), rewriter);
-      auto zeroConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(0)); //FIXME correct index
+      auto zeroConst = builder.create<arith::ConstantIndexOp>(0); //FIXME correct index
       auto loadOp = builder.create<memref::LoadOp>(adaptor.getMemref(), ValueRange{zeroConst.getResult()});
       rewriter.replaceOp(firLoadOp, loadOp);
       return success();
@@ -131,7 +133,8 @@ public:
 
     LogicalResult matchAndRewrite(fir::StoreOp firStoreOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firStoreOp.getLoc(), rewriter);
-      auto storeOp = builder.create<memref::StoreOp>(adaptor.getValue(), adaptor.getMemref());
+      auto zeroConst = builder.create<arith::ConstantIndexOp>(0); //FIXME correct index
+      auto storeOp = builder.create<memref::StoreOp>(adaptor.getValue(), adaptor.getMemref(), ValueRange{zeroConst.getResult()});
       rewriter.replaceOp(firStoreOp, storeOp);
       return success();
     }
@@ -195,13 +198,13 @@ public:
       //See: https://flang.llvm.org/docs/FIRLangRef.html#fir-result-fir-resultop
       Region& thenRegion = ifOp.getThenRegion();
       thenRegion.takeBody(adaptor.getThenRegion());
-      Operation *firResultOp = thenRegion.front().getTerminator();
+      Operation* firResultOp = thenRegion.front().getTerminator();
       rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
 
       if (hasElse) {
         Region& elseRegion = ifOp.getElseRegion();
         elseRegion.takeBody(adaptor.getElseRegion());
-        Operation *firResultOp = elseRegion.front().getTerminator();
+        Operation* firResultOp = elseRegion.front().getTerminator();
         rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
       }
 
@@ -227,11 +230,13 @@ public:
     target.addIllegalDialect<fir::FIROpsDialect>();
     target.addLegalDialect<BuiltinDialect, arith::ArithDialect, func::FuncDialect, scf::SCFDialect, memref::MemRefDialect>();
 
-    Operation *op = getOperation();
+    Operation* op = getOperation();
     FIRToMlirTypeConverter typeConverter(context, *op);
 
     RewritePatternSet patternSet(&context);
     patternSet.add<RewriteAlloca>(typeConverter, &context);
+    patternSet.add<RewriteLoad>(typeConverter, &context);
+    patternSet.add<RewriteStore>(typeConverter, &context);
     patternSet.add<RewriteDeclare>(typeConverter, &context);
     patternSet.add<RewriteIf>(typeConverter, &context);
     patternSet.add<RewriteDoLoop>(typeConverter, &context);
