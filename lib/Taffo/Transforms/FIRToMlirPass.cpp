@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -147,7 +148,7 @@ public:
     ConversionTarget target(context);
 
     target.addIllegalDialect<fir::FIROpsDialect>();
-    target.addLegalDialect<arith::ArithDialect, func::FuncDialect, scf::SCFDialect, memref::MemRefDialect>();
+    target.addLegalDialect<BuiltinDialect, arith::ArithDialect, func::FuncDialect, scf::SCFDialect, memref::MemRefDialect>();
 
     Operation *op = getOperation();
     FIRToMlirTypeConverter typeConverter(context, *op);
