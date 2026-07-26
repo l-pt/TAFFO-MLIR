@@ -14,6 +14,7 @@
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
@@ -24,8 +25,12 @@
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cassert>
 #include <cstdlib>
-#include <iostream>
 
 namespace mlir::taffo {
 #define GEN_PASS_DEF_FIRTOMLIRPASS
@@ -88,7 +93,7 @@ public:
   static SmallVector<Type> convTypes(const TypeConverter* converter, TypeRange in) {
     SmallVector<Type> out;
     if (failed(converter->convertTypes(in, out))) {
-      std::cerr << "conversion error\n";
+      llvm::errs() << "Conversion error\n";
       std::abort();
     }
     return out;
@@ -151,14 +156,15 @@ public:
 
       Value firLb = adaptor.getLowerBound();
       Value firUb = adaptor.getUpperBound();
+      Value firStep = adaptor.getStep();
 
       //If the step is negative, swap lower and upper bound and use -step
-      auto zeroConst = builder.create<arith::ConstantOp>(builder.getI32IntegerAttr(0)); //TODO check if we need different types
-      auto isStepPositive = builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, adaptor.getStep(), zeroConst);
+      auto zeroConst = builder.create<arith::ConstantIndexOp>(0); //TODO check if we need different types
+      auto isStepPositive = builder.create<arith::CmpIOp>(arith::CmpIPredicate::sgt, firStep, zeroConst);
       auto selectLowerBound = builder.create<arith::SelectOp>(isStepPositive.getResult(), firLb, firUb);
       auto selectUpperBound = builder.create<arith::SelectOp>(isStepPositive.getResult(), firUb, firLb);
-      auto negStep = builder.create<arith::SubIOp>(zeroConst, adaptor.getStep());
-      auto selectStep = builder.create<arith::SelectOp>(isStepPositive.getResult(), firDoLoopOp.getStep(), negStep.getResult());
+      auto negStep = builder.create<arith::SubIOp>(zeroConst, firStep);
+      auto selectStep = builder.create<arith::SelectOp>(isStepPositive.getResult(), firStep, negStep.getResult());
 
       //NOTE fir.do_loop has inclusive upper bound, scf.for does not
       auto realUpperBound = builder.create<arith::AddIOp>(selectUpperBound.getResult(), selectStep.getResult());
@@ -167,19 +173,46 @@ public:
           selectStep.getResult(),
           adaptor.getInitArgs());
 
-      //Move the loop body, replace induction variable if necessary
-      //delta = for_iv - original_lb
-      //new_iv = original_ub - delta
-      auto delta = builder.create<arith::SubIOp>(forOp.getInductionVar(), firLb);
-      auto newIv = builder.create<arith::SubIOp>(firUb, delta.getResult());
-      auto selectNewIv = builder.create<arith::SelectOp>(isStepPositive.getResult(), forOp.getInductionVar(), newIv.getResult());
-      rewriter.mergeBlocks(firDoLoopOp.getBody(), forOp.getBody(), {selectNewIv.getResult()});
+      //Replace induction variable
+      {
+        OpBuilder::InsertionGuard guard(builder);
+
+        builder.setInsertionPointToStart(forOp.getBody());
+        auto iv = forOp.getBody()->getArgument(0);
+        auto delta = builder.create<arith::SubIOp>(iv, firLb);
+        auto newIv = builder.create<arith::SubIOp>(firUb, delta.getResult());
+        auto selectNewIv = builder.create<arith::SelectOp>(isStepPositive.getResult(), iv, newIv.getResult());
+
+        IRMapping mapping;
+        mapping.map(firDoLoopOp.getBody()->getArgument(0), selectNewIv.getResult());
+        //NOTE drop_front is used as the first block argument is the IV which we already mapped
+        auto oldIterArgs = firDoLoopOp.getBody()->getArguments().drop_front();
+        auto newIterArgs = forOp.getBody()->getArguments().drop_front();
+        assert(oldIterArgs.size() == newIterArgs.size() && "different number of block args");
+        for (auto it : llvm::zip(oldIterArgs, newIterArgs)) {
+          mapping.map(std::get<0>(it), std::get<1>(it));
+        }
+        for (Operation& op : llvm::make_early_inc_range(firDoLoopOp.getBody()->getOperations())) {
+          builder.clone(op, mapping);
+        }
+      }
 
       //Replace fir.result with scf.yield
-      Operation* firResultOp = forOp.getBody()->getTerminator();
-      rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        assert(forOp.getBody()->mightHaveTerminator() && "scf.for body might have no terminator");
+        Operation* firResultOp = forOp.getBody()->getTerminator();
+        assert(llvm::isa<fir::ResultOp>(firResultOp) && "fir.do_loop body terminator is not a fir.result");
+        rewriter.eraseOp(firResultOp);
+        builder.setInsertionPointToEnd(forOp.getBody());
+        builder.create<scf::YieldOp>(forOp.getRegionIterArgs());;
+      }
 
-      rewriter.replaceOp(firDoLoopOp, forOp);
+      SmallVector<Value> results;
+      results.push_back(zeroConst.getResult()); //FIXME
+      llvm::append_range(results, forOp.getResults());
+      rewriter.replaceOp(firDoLoopOp, results);
+      assert(llvm::isa<scf::YieldOp>(forOp.getBody()->getTerminator()) && "scf.for body terminator is not a scf.yield");
       return success();
     }
   };
@@ -223,6 +256,26 @@ public:
     }
   };
 
+  struct RewriteConvert : public OpConversionPattern<fir::ConvertOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(fir::ConvertOp convertOp, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+      ImplicitLocOpBuilder builder(convertOp.getLoc(), rewriter);
+      Type srcType = adaptor.getValue().getType();
+      Type dstType = convertOp.getResult().getType();
+
+      if ((srcType.isIndex() && dstType.isInteger()) || (srcType.isInteger() && dstType.isIndex())){
+        auto indexCastOp = builder.create<arith::IndexCastOp>(dstType, adaptor.getValue());
+        rewriter.replaceOp(convertOp, indexCastOp);
+        return success();
+      }
+
+      llvm::errs() << "Unsupported fir.convert\n";
+      return failure();
+    }
+  };
+
+
   void runOnOperation() override {
     MLIRContext& context = getContext();
     ConversionTarget target(context);
@@ -234,13 +287,14 @@ public:
     FIRToMlirTypeConverter typeConverter(context, *op);
 
     RewritePatternSet patternSet(&context);
+    patternSet.add<RewriteDummyScope>(typeConverter, &context);
     patternSet.add<RewriteAlloca>(typeConverter, &context);
     patternSet.add<RewriteLoad>(typeConverter, &context);
     patternSet.add<RewriteStore>(typeConverter, &context);
     patternSet.add<RewriteDeclare>(typeConverter, &context);
+    patternSet.add<RewriteConvert>(typeConverter, &context);
     patternSet.add<RewriteIf>(typeConverter, &context);
     patternSet.add<RewriteDoLoop>(typeConverter, &context);
-    patternSet.add<RewriteDummyScope>(typeConverter, &context);
 
     (void) applyFullConversion(op, target, std::move(patternSet));
   }
