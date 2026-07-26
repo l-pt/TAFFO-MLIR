@@ -14,7 +14,6 @@
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
@@ -183,18 +182,11 @@ public:
         auto newIv = builder.create<arith::SubIOp>(firUb, delta.getResult());
         auto selectNewIv = builder.create<arith::SelectOp>(isStepPositive.getResult(), iv, newIv.getResult());
 
-        IRMapping mapping;
-        mapping.map(firDoLoopOp.getBody()->getArgument(0), selectNewIv.getResult());
+        SmallVector<Value> argValues;
+        argValues.push_back(selectNewIv.getResult());
         //NOTE drop_front is used as the first block argument is the IV which we already mapped
-        auto oldIterArgs = firDoLoopOp.getBody()->getArguments().drop_front();
-        auto newIterArgs = forOp.getBody()->getArguments().drop_front();
-        assert(oldIterArgs.size() == newIterArgs.size() && "different number of block args");
-        for (auto it : llvm::zip(oldIterArgs, newIterArgs)) {
-          mapping.map(std::get<0>(it), std::get<1>(it));
-        }
-        for (Operation& op : llvm::make_early_inc_range(firDoLoopOp.getBody()->getOperations())) {
-          builder.clone(op, mapping);
-        }
+        llvm::append_range(argValues, forOp.getBody()->getArguments().drop_front());
+        rewriter.mergeBlocks(firDoLoopOp.getBody(), forOp.getBody(), argValues);
       }
 
       //Replace fir.result with scf.yield
@@ -203,16 +195,17 @@ public:
         assert(forOp.getBody()->mightHaveTerminator() && "scf.for body might have no terminator");
         Operation* firResultOp = forOp.getBody()->getTerminator();
         assert(llvm::isa<fir::ResultOp>(firResultOp) && "fir.do_loop body terminator is not a fir.result");
-        rewriter.eraseOp(firResultOp);
         builder.setInsertionPointToEnd(forOp.getBody());
-        builder.create<scf::YieldOp>(forOp.getRegionIterArgs());;
+        auto yieldOp = builder.create<scf::YieldOp>(forOp.getRegionIterArgs());
+        rewriter.replaceOp(firResultOp, yieldOp);
+        assert(llvm::isa<scf::YieldOp>(forOp.getBody()->getTerminator()) && "scf.for body terminator is not a scf.yield");
       }
 
       SmallVector<Value> results;
-      results.push_back(zeroConst.getResult()); //FIXME
+      auto toIdx = builder.create<arith::IndexCastOp>(IndexType::get(getContext()), forOp.getResults().front());
+      results.push_back(toIdx.getResult()); //FIXME
       llvm::append_range(results, forOp.getResults());
       rewriter.replaceOp(firDoLoopOp, results);
-      assert(llvm::isa<scf::YieldOp>(forOp.getBody()->getTerminator()) && "scf.for body terminator is not a scf.yield");
       return success();
     }
   };
@@ -270,7 +263,7 @@ public:
         return success();
       }
 
-      llvm::errs() << "Unsupported fir.convert\n";
+      convertOp.emitError("Unsupported fir.convert");
       return failure();
     }
   };
