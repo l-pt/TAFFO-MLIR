@@ -289,7 +289,9 @@ public:
     patternSet.add<RewriteIf>(typeConverter, &context);
     patternSet.add<RewriteDoLoop>(typeConverter, &context);
 
-    (void) applyFullConversion(op, target, std::move(patternSet));
+    if (failed(applyFullConversion(op, target, std::move(patternSet)))) {
+      signalPassFailure();
+    }
   }
 };
 } // namespace mlir
