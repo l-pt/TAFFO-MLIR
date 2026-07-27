@@ -215,6 +215,18 @@ public:
   struct RewriteIf : public OpConversionPattern<fir::IfOp> {
     using OpConversionPattern::OpConversionPattern;
 
+    static void regionTakeBodyAndChangeTerminator(Region& from, Region& to, ImplicitLocOpBuilder& builder, ConversionPatternRewriter& rewriter) {
+      OpBuilder::InsertionGuard guard(builder);
+      to.takeBody(from);
+      Block& body = to.front();
+      assert(body.mightHaveTerminator() && "fir.if body does not have a terminator");
+      Operation* terminator = body.getTerminator();
+      assert(llvm::isa<fir::ResultOp>(terminator) && "fir.if body terminator is not a fir.result");
+      builder.setInsertionPointToEnd(&body);
+      auto yieldOp = builder.create<scf::YieldOp>(terminator->getOperands());
+      rewriter.replaceOp(terminator, yieldOp);
+    }
+
     LogicalResult matchAndRewrite(fir::IfOp firIfOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firIfOp.getLoc(), rewriter);
 
@@ -224,16 +236,9 @@ public:
       //NOTE each block is terminated by a fir.result op, we have to convert it in a scf.yield op.
       //See: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfyield-scfyieldop
       //See: https://flang.llvm.org/docs/FIRLangRef.html#fir-result-fir-resultop
-      Region& thenRegion = ifOp.getThenRegion();
-      thenRegion.takeBody(adaptor.getThenRegion());
-      Operation* firResultOp = thenRegion.front().getTerminator();
-      rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
-
+      regionTakeBodyAndChangeTerminator(adaptor.getThenRegion(), ifOp.getThenRegion(), builder, rewriter);
       if (hasElse) {
-        Region& elseRegion = ifOp.getElseRegion();
-        elseRegion.takeBody(adaptor.getElseRegion());
-        Operation* firResultOp = elseRegion.front().getTerminator();
-        rewriter.replaceOpWithNewOp<scf::YieldOp>(firResultOp, firResultOp->getOperands());
+        regionTakeBodyAndChangeTerminator(adaptor.getElseRegion(), ifOp.getElseRegion(), builder, rewriter);
       }
 
       rewriter.replaceOp(firIfOp, ifOp);
