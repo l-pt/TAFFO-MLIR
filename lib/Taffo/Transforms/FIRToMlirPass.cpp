@@ -9,7 +9,10 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributeInterfaces.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
@@ -25,12 +28,15 @@
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <cstdlib>
+#include <optional>
 #include <utility>
 
 namespace mlir::taffo {
@@ -68,7 +74,7 @@ public:
       });
       addConversion([](fir::ReferenceType type) {
         //FIXME shape
-        return MemRefType::get({1}, type.getElementType()); //1xT
+        return MemRefType::get({}, type.getElementType());
       });
 
       addSourceMaterialization([](OpBuilder& builder, Type resultType, ValueRange inputs, Location loc) -> Value {
@@ -91,9 +97,9 @@ public:
     }
   };
 
-  static SmallVector<Type> convTypes(const TypeConverter* converter, TypeRange in) {
+  static SmallVector<Type> convTypes(const TypeConverter& converter, TypeRange in) {
     SmallVector<Type> out;
-    if (failed(converter->convertTypes(in, out))) {
+    if (failed(converter.convertTypes(in, out))) {
       llvm::errs() << "Conversion error\n";
       std::abort();
     }
@@ -106,6 +112,7 @@ public:
     LogicalResult matchAndRewrite(fir::DeclareOp firDeclareOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       emitWarning(firDeclareOp.getLoc()) << "fir::declare shape " << firDeclareOp.getShape();
       emitWarning(firDeclareOp.getLoc()) << "fir::declare result " << firDeclareOp.getResult();
+      rewriter.replaceOp(firDeclareOp, adaptor.getMemref());
       return success();
     }
   };
@@ -116,7 +123,7 @@ public:
     LogicalResult matchAndRewrite(fir::AllocaOp firAllocaOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firAllocaOp.getLoc(), rewriter);
       auto convertedType = getTypeConverter()->convertType(firAllocaOp.getAllocatedType());
-      auto memrefAllocaOp = builder.create<memref::AllocaOp>(MemRefType::get({1}, convertedType)); //FIXME shape
+      auto memrefAllocaOp = builder.create<memref::AllocaOp>(MemRefType::get({}, convertedType)); //FIXME shape
       rewriter.replaceOp(firAllocaOp, memrefAllocaOp);
       return success();
     }
@@ -128,7 +135,7 @@ public:
     LogicalResult matchAndRewrite(fir::LoadOp firLoadOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firLoadOp.getLoc(), rewriter);
       auto zeroConst = builder.create<arith::ConstantIndexOp>(0); //FIXME correct index
-      auto loadOp = builder.create<memref::LoadOp>(adaptor.getMemref(), ValueRange{zeroConst.getResult()});
+      auto loadOp = builder.create<memref::LoadOp>(adaptor.getMemref(), ValueRange{});
       rewriter.replaceOp(firLoadOp, loadOp);
       return success();
     }
@@ -140,7 +147,7 @@ public:
     LogicalResult matchAndRewrite(fir::StoreOp firStoreOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       ImplicitLocOpBuilder builder(firStoreOp.getLoc(), rewriter);
       auto zeroConst = builder.create<arith::ConstantIndexOp>(0); //FIXME correct index
-      auto storeOp = builder.create<memref::StoreOp>(adaptor.getValue(), adaptor.getMemref(), ValueRange{zeroConst.getResult()});
+      auto storeOp = builder.create<memref::StoreOp>(adaptor.getValue(), adaptor.getMemref(), ValueRange{});
       rewriter.replaceOp(firStoreOp, storeOp);
       return success();
     }
@@ -231,7 +238,7 @@ public:
       ImplicitLocOpBuilder builder(firIfOp.getLoc(), rewriter);
 
       bool hasElse = !adaptor.getElseRegion().empty();
-      auto ifOp = builder.create<scf::IfOp>(convTypes(getTypeConverter(), firIfOp.getResultTypes()), adaptor.getCondition(), hasElse);
+      auto ifOp = builder.create<scf::IfOp>(convTypes(*getTypeConverter(), firIfOp.getResultTypes()), adaptor.getCondition(), hasElse);
 
       //NOTE each block is terminated by a fir.result op, we have to convert it in a scf.yield op.
       //See: https://mlir.llvm.org/docs/Dialects/SCFDialect/#scfyield-scfyieldop
@@ -275,6 +282,97 @@ public:
     }
   };
 
+  struct RewriteGlobal : public OpConversionPattern<fir::GlobalOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    // Even simple i32 globals are defined with an initializer block, so we have
+    // to support it at least for simple cases (scalars, not arrays)
+    static std::optional<TypedAttr> getInitialValueFromInitializerBlock(Type globalType, Block& block) {
+      auto hasValueOp = llvm::dyn_cast<fir::HasValueOp>(block.getTerminator());
+      if (!hasValueOp) {
+        return std::nullopt;
+      }
+      auto resVal = hasValueOp.getResval();
+      auto definingOp = resVal.getDefiningOp<mlir::arith::ConstantOp>();
+      if (!definingOp) {
+        return std::nullopt;
+      }
+      auto val = definingOp.getValue();
+      return mlir::DenseElementsAttr::get(
+          RankedTensorType::get({}, globalType),
+          llvm::ArrayRef<Attribute>{val});
+    }
+
+    LogicalResult matchAndRewrite(fir::GlobalOp globalOp, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+      ImplicitLocOpBuilder builder(globalOp.getLoc(), rewriter);
+
+      Type globalType = adaptor.getType();
+      emitWarning(globalOp.getLoc()) << "globalType " << globalType;
+
+      std::optional<TypedAttr> initialValue = std::nullopt;
+      if (globalOp.hasInitializationBody()) {
+        if (!globalType.isIntOrIndexOrFloat()) {
+          emitError(globalOp.getLoc()) << "initializer block on a non-scalar global";
+          return failure();
+        }
+        initialValue = getInitialValueFromInitializerBlock(globalType, globalOp.getBlock());
+        if (!initialValue) {
+          emitError(globalOp.getLoc()) << "unable to get initial value of initializer block";
+          return failure();
+        }
+      }
+
+      auto memrefTypeOpt = ([&]() -> std::optional<MemRefType> {
+        if (globalType.isIntOrIndexOrFloat()) {
+          return MemRefType::get({}, globalType);
+        }
+        if (auto arrayType = mlir::dyn_cast<fir::SequenceType>(globalType)) {
+          return MemRefType::get(arrayType.getShape(), arrayType.getElementType());
+        }
+        return std::nullopt;
+      })();
+      if (!memrefTypeOpt) {
+        emitError(globalOp.getLoc()) << "unsupported global type " << globalType;
+        return failure();
+      }
+      auto memrefType = *memrefTypeOpt;
+
+      auto memrefGlobalOp = builder.create<memref::GlobalOp>(
+          adaptor.getSymNameAttr(),
+          StringAttr::get(getContext(), "private"),
+          TypeAttr::get(memrefType),
+          initialValue ? *initialValue : Attribute{},
+          UnitAttr{}, // TODO constant?
+          IntegerAttr{}); // TODO alignment
+
+      emitWarning(globalOp.getLoc()) << "symName " << adaptor.getSymName();
+      emitWarning(globalOp.getLoc()) << "memreftype " << memrefType;
+      emitWarning(globalOp.getLoc()) << "memrefGlobalOp " << memrefGlobalOp;
+
+      rewriter.replaceOp(globalOp, memrefGlobalOp);
+      return success();
+    }
+  };
+
+  struct RewriteAddressOf : public OpConversionPattern<fir::AddrOfOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(fir::AddrOfOp addrOfOp, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+      ImplicitLocOpBuilder builder(addrOfOp.getLoc(), rewriter);
+
+      assert(llvm::isa<fir::ReferenceType>(addrOfOp.getType()));
+
+      auto type = getTypeConverter()->convertType(addrOfOp.getType());
+      assert(llvm::isa<MemRefType>(type));
+
+      auto sym = addrOfOp.getSymbol();
+      auto symRefAttr = FlatSymbolRefAttr::get(rewriter.getContext(), sym.getRootReference().getValue());
+
+      auto memrefGetGlobalOp = builder.create<memref::GetGlobalOp>(type, symRefAttr);
+      rewriter.replaceOp(addrOfOp, memrefGetGlobalOp);
+      return success();
+    }
+  };
 
   void runOnOperation() override {
     MLIRContext& context = getContext();
@@ -295,6 +393,8 @@ public:
     patternSet.add<RewriteConvert>(typeConverter, &context);
     patternSet.add<RewriteIf>(typeConverter, &context);
     patternSet.add<RewriteDoLoop>(typeConverter, &context);
+    patternSet.add<RewriteGlobal>(typeConverter, &context);
+    patternSet.add<RewriteAddressOf>(typeConverter, &context);
 
     if (failed(applyFullConversion(op, target, std::move(patternSet)))) {
       signalPassFailure();
