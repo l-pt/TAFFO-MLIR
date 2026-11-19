@@ -10,13 +10,17 @@ def FIRToMlirPass
     let summary = "Convert FIR to intree MLIR dialects";
 
     let description = [{
-        Raise scf and Arith ops generated from Polygeist to Taffo dialect.
+        Convert FIR to intree MLIR dialects
     }];
 
     let dependentDialects = [
         "fir::FIROpsDialect",
         "mlir::scf::SCFDialect",
-        "mlir::memref::MemRefDialect"
+        "mlir::cf::ControlFlowDialect",
+        "mlir::memref::MemRefDialect",
+        "mlir::shape::ShapeDialect",
+        "mlir::func::FuncDialect",
+        "mlir::LLVM::LLVMDialect"
     ];
 }
 
