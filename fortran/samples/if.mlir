@@ -2,6 +2,8 @@ module attributes {dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vec
   func.func @_QPiftest() -> i32 {
     %c20_i32 = arith.constant 20 : i32
     %c10_i32 = arith.constant 10 : i32
+    %c44_i32 = arith.constant 44 : i32
+    %c32_i32 = arith.constant 32 : i32
     %c12_i32 = arith.constant 12 : i32
     %c77_i32 = arith.constant 77 : i32
     %0 = fir.dummy_scope : !fir.dscope
@@ -13,7 +15,13 @@ module attributes {dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vec
     %5 = fir.load %4 : !fir.ref<i32>
     %6 = arith.cmpi sgt, %5, %c12_i32 : i32
     fir.if %6 {
-      fir.store %c10_i32 to %2 : !fir.ref<i32>
+      %8 = fir.load %4 : !fir.ref<i32>
+      %9 = arith.cmpi sgt, %8, %c32_i32 : i32
+      fir.if %9 {
+        fir.store %c44_i32 to %2 : !fir.ref<i32>
+      } else {
+        fir.store %c10_i32 to %2 : !fir.ref<i32>
+      }
     } else {
       fir.store %c20_i32 to %2 : !fir.ref<i32>
     }

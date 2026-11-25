@@ -8,11 +8,15 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -37,6 +41,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 #include <cassert>
 #include <numeric>
@@ -58,11 +63,19 @@ llvm::FailureOr<llvm::SmallVector<mlir::Type>> convTypes(const mlir::TypeConvert
   return out;
 }
 
-llvm::FailureOr<mlir::MemRefType> getMemRefToType(mlir::Type type, mlir::MLIRContext& context) {
+llvm::FailureOr<mlir::Type> convType(const mlir::TypeConverter& converter, mlir::Type in) {
+  auto out = llvm::SmallVector<mlir::Type>{};
+  if (failed(converter.convertTypes(mlir::TypeRange{in}, out))) {
+    return llvm::failure();
+  }
+  return out[0];
+}
+
+llvm::FailureOr<mlir::MemRefType> getMemRefToType(mlir::Type type, mlir::MLIRContext& context) { //NOLINT
   if (type.isSignlessInteger(8)) {
     return llvm::failure();
   }
-  if (type.isIntOrIndexOrFloat()) {
+  if (type.isIntOrIndexOrFloat() || llvm::isa<mlir::MemRefType>(type)) {
     return mlir::MemRefType::get({}, type);
   }
   if (auto arrayType = llvm::dyn_cast<fir::SequenceType>(type)) {
@@ -91,6 +104,15 @@ llvm::FailureOr<mlir::MemRefType> getMemRefToType(mlir::Type type, mlir::MLIRCon
       return llvm::failure();
     }
     return mlir::MemRefType::get(charType.getLen(), mlir::IntegerType::get(&context, 8));
+  }
+  if (auto boxType = llvm::dyn_cast<fir::BoxType>(type)) {
+    if (auto heapType = llvm::dyn_cast<fir::HeapType>(boxType.getElementType())) {
+      assert(llvm::isa<fir::SequenceType>(heapType.getElementType()));
+      auto m = getMemRefToType(heapType.getElementType(), context);
+      if (llvm::succeeded(m)) {
+        return mlir::MemRefType::get({}, *m);
+      }
+    }
   }
   return llvm::failure();
 }
@@ -183,6 +205,21 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
         if (auto noneType = llvm::dyn_cast<NoneType>(type.getElementType())) {
           return mlir::LLVM::LLVMPointerType::get(&ctx);
         }
+
+        // box<heap<array<x>>> is converted to memref<x>
+        if (auto heapType = llvm::dyn_cast<fir::HeapType>(type.getElementType())) {
+          if (auto arrayType = llvm::dyn_cast<fir::SequenceType>(heapType.getElementType())) {
+            // array<xyz> -> memref<xyz>
+            return getMemRefToType(arrayType, ctx);
+          }
+        }
+        return failure();
+      });
+      addConversion([&ctx](fir::HeapType type) -> FailureOr<Type> {
+        // heap<array<x>> is converted to memref<x>
+        if (auto arrayType = llvm::dyn_cast<fir::SequenceType>(type.getElementType())) {
+          return getMemRefToType(arrayType, ctx);
+        }
         return failure();
       });
 
@@ -219,7 +256,7 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
     static Value emitSizeCalculation(ValueRange vals, ImplicitLocOpBuilder& builder) {
       assert(!vals.empty());
       return std::accumulate(vals.begin() + 1, vals.end(), vals.front(), [&builder](const Value& a, const Value& b) {
-        auto mulOp = builder.create<arith::MulIOp>(a, b);
+        auto mulOp = builder.create<index::MulOp>(a, b);
         return mulOp.getResult();
       });
     }
@@ -249,7 +286,7 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
       // integer, intent(in) :: n, m
       // integer :: myarray(n, m)
       if (auto arrayType = llvm::dyn_cast<fir::SequenceType>(convertedType); arrayType && arrayType.hasDynamicExtents()) {
-        firAllocaOp.emitRemark("array with dynamic shape: ") << adaptor.getShape();
+        LLVM_DEBUG(llvm::dbgs() << "Array with dynamic shape allocated on the stack in " << firAllocaOp << "\n");
         auto nElems = emitSizeCalculation(adaptor.getShape(), builder);
         auto memrefAllocaOp = builder.create<memref::AllocaOp>(
             mlir::MemRefType::get({ShapedType::kDynamic}, arrayType.getElementType()), // ?xT
@@ -286,7 +323,7 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
 
       // We only support dynamic arrays with allocmem
       if (auto arrayType = llvm::dyn_cast<fir::SequenceType>(convertedType); arrayType && arrayType.hasDynamicExtents()) {
-        allocOp.emitRemark("array with dynamic shape: ") << adaptor.getShape();
+        LLVM_DEBUG(llvm::dbgs() << "Array with dynamic shape allocated on the heap in " << allocOp << "\n");
         auto nElems = RewriteAlloca::emitSizeCalculation(adaptor.getShape(), builder);
         auto memrefAllocOp = builder.create<memref::AllocOp>(
             mlir::MemRefType::get({ShapedType::kDynamic}, arrayType.getElementType()), // ?xT
@@ -313,18 +350,12 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
     LogicalResult matchAndRewrite(fir::LoadOp firLoadOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       auto builder = ImplicitLocOpBuilder{firLoadOp.getLoc(), rewriter};
 
-      // Arrays
+      // Stack arrays
       if (auto arrCoorOp = firLoadOp.getOperand().getDefiningOp<fir::ArrayCoorOp>()) {
-        firLoadOp.emitWarning("fir.load operand was defined with array_coor");
+        LLVM_DEBUG(llvm::dbgs() << "fir.load operand was defined with array_coor\n");
 
         // Array we are trying to load from
         auto array = rewriter.getRemappedValue(arrCoorOp.getMemref());
-        firLoadOp.emitWarning("array is ") << array;
-
-        auto indices = arrCoorOp.getIndices();
-        firLoadOp.emitWarning("indices is ") << indices;
-        firLoadOp.emitRemark("shape is ") << arrCoorOp.getShape();
-
         auto indicesShifted = lowerArrayIndices(arrCoorOp, builder, rewriter);
         if (failed(indicesShifted)) {
           firLoadOp.emitError("index shift failed");
@@ -350,16 +381,13 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
       auto builder = ImplicitLocOpBuilder{firStoreOp.getLoc(), rewriter};
 
       if (auto arrCoorOp = firStoreOp.getMemref().getDefiningOp<fir::ArrayCoorOp>()) {
-        firStoreOp.emitWarning("fir.load operand was defined with array_coor");
+        LLVM_DEBUG(llvm::dbgs() << "fir.load operand was defined with array_coor\n");
 
         // Array we are trying to store in
         auto array = rewriter.getRemappedValue(arrCoorOp.getMemref());
-        firStoreOp.emitWarning("array is ") << array;
-
-        auto indices = arrCoorOp.getIndices();
-        firStoreOp.emitWarning("indices is ") << indices;
-        firStoreOp.emitRemark("shape is ") << arrCoorOp.getShape();
-
+        auto arr = arrCoorOp.getMemref();
+        LLVM_DEBUG(llvm::dbgs() << "RewriteStore array is " << array << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "RewriteStore arr is " << arr << "\n");
         auto indicesShifted = lowerArrayIndices(arrCoorOp, builder, rewriter);
         if (failed(indicesShifted)) {
           firStoreOp.emitError("index shift failed");
@@ -447,12 +475,22 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
 
     static void regionTakeBodyAndChangeTerminator(Region& from, Region& to, ImplicitLocOpBuilder& builder, ConversionPatternRewriter& rewriter) {
       auto guard = OpBuilder::InsertionGuard{builder};
-      to.takeBody(from);
-      auto& body = to.front();
-      assert(body.mightHaveTerminator() && "fir.if body does not have a terminator");
-      auto* terminator = body.getTerminator();
+
+      auto& fromBody = from.front();
+      auto& toBody = to.front();
+
+      // erase scf.yield in toBody, it is created by default
+      assert(fromBody.mightHaveTerminator() && "newly created scf.if has no terminator");
+      assert(llvm::isa<scf::YieldOp>(toBody.getTerminator()) && "scf.if body terminator is not a scf.yield");
+      rewriter.eraseOp(toBody.getTerminator());
+
+      toBody.getOperations().splice(toBody.end(), fromBody.getOperations());
+
+      assert(toBody.mightHaveTerminator() && "fir.if body does not have a terminator");
+      auto* terminator = toBody.getTerminator();
       assert(llvm::isa<fir::ResultOp>(terminator) && "fir.if body terminator is not a fir.result");
-      builder.setInsertionPointToEnd(&body);
+
+      builder.setInsertionPointToEnd(&toBody);
       auto yieldOp = builder.create<scf::YieldOp>(terminator->getOperands());
       rewriter.replaceOp(terminator, yieldOp);
     }
@@ -566,30 +604,39 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
   struct RewriteGlobal : public OpConversionPattern<fir::GlobalOp> {
     using OpConversionPattern::OpConversionPattern;
 
-    // Even simple i32 globals are defined with an initializer block, so we have
-    // to support it at least for simple cases (scalars and string literals, not arrays)
     static FailureOr<Attribute> getInitialValueFromInitializerBlock(Type globalType, Block& block, ImplicitLocOpBuilder& builder) {
       auto hasValueOp = llvm::dyn_cast<fir::HasValueOp>(block.getTerminator());
       if (!hasValueOp) {
         return failure();
       }
       auto resVal = hasValueOp.getResval();
+      // Scalar constant
       if (auto constantOp = resVal.getDefiningOp<arith::ConstantOp>()) {
         auto val = constantOp.getValue();
         return mlir::DenseElementsAttr::get(
             RankedTensorType::get({}, globalType),
             SmallVector<Attribute>{val});
       }
+      // String literal
       if (auto litOp = resVal.getDefiningOp<fir::StringLitOp>()) {
-        auto arraryAttr = llvm::cast<StringAttr>(litOp.getValue());
+        auto stringAttr = llvm::cast<StringAttr>(litOp.getValue());
         auto sizeAttr = llvm::cast<IntegerAttr>(litOp.getSize());
         auto chars = SmallVector<Attribute>{};
-        for (auto c : arraryAttr) {
+        for (char c : stringAttr) {
           chars.push_back(builder.getI8IntegerAttr(c));
         }
         return mlir::DenseElementsAttr::get(
             RankedTensorType::get({sizeAttr.getInt()}, builder.getIntegerType(8)),
             chars);
+      }
+      // Zero initialized static array
+      if (auto zeroOp = resVal.getDefiningOp<fir::ZeroOp>()) {
+        if (auto arrayType = llvm::dyn_cast<fir::SequenceType>(globalType)) {
+          auto zero = builder.getZeroAttr(arrayType.getElementType());
+          return mlir::DenseElementsAttr::get(
+              RankedTensorType::get(arrayType.getShape(), arrayType.getElementType()),
+              zero);
+        }
       }
       return failure();
     }
@@ -597,12 +644,36 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
     LogicalResult matchAndRewrite(fir::GlobalOp globalOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       auto builder = ImplicitLocOpBuilder{globalOp.getLoc(), rewriter};
 
-      auto globalType = adaptor.getType();
-      emitWarning(globalOp.getLoc()) << "globalType " << globalType;
+      auto firGlobalType = convType(*getTypeConverter(), adaptor.getType());
+      if (failed(firGlobalType)) {
+        globalOp.emitError("Failed to convert global type ") << adaptor.getType();
+        return failure();
+      }
+      LLVM_DEBUG(llvm::dbgs() << "fir.global converted type is " << *firGlobalType << "\n");
 
+      // Heap arrays
+      if (auto firGlobalMemRefType = llvm::dyn_cast<MemRefType>(*firGlobalType)) {
+        // Global type was box<heap<array<x>>> and was converted to memref<x>
+        // by the type converter.
+        auto wrapperType = MemRefType::get({}, firGlobalMemRefType);
+        auto attributes = SmallVector<NamedAttribute>{
+          NamedAttribute{"type", TypeAttr::get(wrapperType)},
+          NamedAttribute{"sym_name", adaptor.getSymNameAttr()},
+          NamedAttribute{"sym_visibility", StringAttr::get(getContext(), "private")},
+        };
+        if (globalOp.getConstant()) {
+          attributes.push_back(NamedAttribute{"constant", UnitAttr::get(getContext())});
+        }
+        auto memrefGlobalOp = builder.create<memref::GlobalOp>(TypeRange{}, ValueRange{}, attributes); 
+        rewriter.replaceOp(globalOp, memrefGlobalOp);
+        LLVM_DEBUG(llvm::dbgs() << "RewriteGlobal replaced with " << memrefGlobalOp << "\n");
+        return success();
+      }
+
+      // Scalars, static arrays, string literals
       auto initialValue = ([&]() -> FailureOr<Attribute> {
         if (globalOp.hasInitializationBody()) {
-          auto initVal = getInitialValueFromInitializerBlock(globalType, globalOp.getBlock(), builder);
+          auto initVal = getInitialValueFromInitializerBlock(*firGlobalType, globalOp.getBlock(), builder);
           if (failed(initVal)) {
             emitError(globalOp.getLoc()) << "unable to get initial value of initializer block";
             return failure();
@@ -618,26 +689,26 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
         return failure();
       }
 
-      auto memrefType = getMemRefToType(globalType, *getContext());
+      auto memrefType = getMemRefToType(*firGlobalType, *getContext());
       if (failed(memrefType)) {
-        emitError(globalOp.getLoc()) << "unsupported global type " << globalType;
+        globalOp.emitError("unsupported global type ") << *firGlobalType;
         return failure();
       }
 
-      auto memrefGlobalOp = builder.create<memref::GlobalOp>(
-          adaptor.getSymNameAttr(),
-          StringAttr::get(getContext(), "private"),
-          TypeAttr::get(*memrefType),
-          *initialValue,
-          UnitAttr{}, // TODO constant?
-          IntegerAttr{}); // TODO alignment
-
-#if 0
-      emitWarning(globalOp.getLoc()) << "symName " << adaptor.getSymName();
-      emitWarning(globalOp.getLoc()) << "memreftype " << memrefType;
-      emitWarning(globalOp.getLoc()) << "memrefGlobalOp " << memrefGlobalOp;
-#endif
-
+      auto t = MemRefType::get(memrefType->getShape(), memrefType->getElementType());
+      auto attributes = SmallVector<NamedAttribute>{
+        NamedAttribute{"type", TypeAttr::get(t)},
+        NamedAttribute{"sym_name", adaptor.getSymNameAttr()},
+        NamedAttribute{"sym_visibility", StringAttr::get(getContext(), "private")},
+        NamedAttribute{"initial_value", *initialValue},
+      };
+      if (globalOp.getConstant()) {
+        attributes.push_back(NamedAttribute{"constant", UnitAttr::get(getContext())});
+      }
+      if (auto align = globalOp.getAlignmentAttr()) {
+        attributes.push_back(NamedAttribute{"alignment", align});
+      }
+      auto memrefGlobalOp = builder.create<memref::GlobalOp>(TypeRange{}, ValueRange{}, attributes);
       rewriter.replaceOp(globalOp, memrefGlobalOp);
       return success();
     }
@@ -646,20 +717,57 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
   struct RewriteAddressOf : public OpConversionPattern<fir::AddrOfOp> {
     using OpConversionPattern::OpConversionPattern;
 
+    static SmallVector<OpFoldResult> toAttr(ArrayRef<int64_t> v, ImplicitLocOpBuilder& builder) {
+      auto r = SmallVector<OpFoldResult>{};
+      for (auto i : v) {
+        r.push_back(builder.getIndexAttr(i));
+      }
+      return r;
+    }
+
+    static SmallVector<OpFoldResult> getStrides(ArrayRef<int64_t> shape, ImplicitLocOpBuilder& builder) {
+      auto strides = SmallVector<OpFoldResult>{builder.getIndexAttr(1)};
+      auto val = shape.front();
+      for (auto e : shape.drop_front().drop_back()) {
+        strides.push_back(builder.getIndexAttr(val));
+        val = val * e;
+      }
+      strides.push_back(builder.getIndexAttr(val));
+      return strides;
+    }
+
     LogicalResult matchAndRewrite(fir::AddrOfOp addrOfOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
       auto builder = ImplicitLocOpBuilder{addrOfOp.getLoc(), rewriter};
-
-      assert(llvm::isa<fir::ReferenceType>(addrOfOp.getType()));
-
-      auto type = getTypeConverter()->convertType(addrOfOp.getType());
-      assert(llvm::isa<MemRefType>(type));
-
       auto sym = addrOfOp.getSymbol();
       auto symRefAttr = FlatSymbolRefAttr::get(rewriter.getContext(), sym.getRootReference().getValue());
 
-      auto memrefGetGlobalOp = builder.create<memref::GetGlobalOp>(type, symRefAttr);
-      rewriter.replaceOp(addrOfOp, memrefGetGlobalOp);
-      return success();
+      auto firRefType = llvm::cast<fir::ReferenceType>(addrOfOp.getType());
+      LLVM_DEBUG(llvm::dbgs() << "fir.address_of global type is " << addrOfOp.getType() << "\n");
+
+      if (auto type = llvm::dyn_cast<MemRefType>(getTypeConverter()->convertType(firRefType))) {
+        auto gt = MemRefType::get(type.getShape(), type.getElementType());
+        auto memrefGetGlobalOp = builder.create<memref::GetGlobalOp>(gt, symRefAttr);
+
+        auto t = getMemRefToType(
+            fir::SequenceType::get(type.getShape(), type.getElementType()),
+            *getContext());
+        if (type.getShape().size() > 1) {
+          auto sizes = toAttr(type.getShape(), builder);
+          auto castOp = builder.create<memref::ReinterpretCastOp>(
+              *t, //resultType
+              memrefGetGlobalOp.getResult(), //source
+              builder.getIndexAttr(0), //offset
+              sizes, //sizes
+              getStrides(type.getShape(), builder)); //strides
+          rewriter.replaceOp(addrOfOp, castOp);
+        } else {
+          rewriter.replaceOp(addrOfOp, memrefGetGlobalOp);
+        }
+
+        return success();
+      }
+
+      return failure();
     }
   };
 
@@ -719,21 +827,31 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
         zeroBitsOp.emitError("Unsupported");
         return failure();
       }
-      auto firCallOp = llvm::dyn_cast<fir::CallOp>(*res.getUsers().begin());
-      if (!firCallOp) {
-        zeroBitsOp.emitError("Unsupported");
-        return failure();
-      }
-      auto callee = firCallOp.getCallee()->getRootReference().getValue();
-      if (!callee.starts_with("_Fortran")) {
-        zeroBitsOp.emitError("Unsupported");
-        return failure();
-      }
+      if (auto firCallOp = llvm::dyn_cast<fir::CallOp>(*res.getUsers().begin())) {
+        auto callee = firCallOp.getCallee()->getRootReference().getValue();
+        if (!callee.starts_with("_Fortran")) {
+          zeroBitsOp.emitError("Unsupported");
+          return failure();
+        }
 
-      auto llvmPtrType = LLVM::LLVMPointerType::get(getContext());
-      auto llvmZeroOp = builder.create<LLVM::ZeroOp>(llvmPtrType);
-      rewriter.replaceOp(zeroBitsOp, llvmZeroOp);
-      return success();
+        auto llvmPtrType = LLVM::LLVMPointerType::get(getContext());
+        auto llvmZeroOp = builder.create<LLVM::ZeroOp>(llvmPtrType);
+        rewriter.replaceOp(zeroBitsOp, llvmZeroOp);
+        return success();
+      }
+      if (auto emboxOp = llvm::dyn_cast<fir::EmboxOp>(*res.getUsers().begin())) {
+        if (!emboxOp.getResult().hasOneUse()) {
+          zeroBitsOp.emitError("Unsupported");
+          return failure();
+        }
+        if (auto storeOp = llvm::dyn_cast<fir::StoreOp>(*emboxOp.getResult().getUsers().begin())) {
+          rewriter.eraseOp(storeOp);
+          rewriter.eraseOp(emboxOp);
+          rewriter.eraseOp(zeroBitsOp);
+          return success();
+        }
+      }
+      return failure();
     }
   };
 
@@ -758,13 +876,60 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
     }
   };
 
+  struct RewriteEmbox : public OpConversionPattern<fir::EmboxOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(fir::EmboxOp emboxOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      rewriter.replaceOp(emboxOp, adaptor.getOperands()[0]);
+      return success();
+    }
+  };
+
+  struct RewriteBoxAddr : public OpConversionPattern<fir::BoxAddrOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(fir::BoxAddrOp boxAddrOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      rewriter.replaceOp(boxAddrOp, adaptor.getOperands()[0]);
+      return success();
+    }
+  };
+
+  struct RewriteBoxDims : public OpConversionPattern<fir::BoxDimsOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(fir::BoxDimsOp boxDimsOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      rewriter.eraseOp(boxDimsOp);
+      return success();
+    }
+  };
+
+  struct RewriteFreeMem : public OpConversionPattern<fir::FreeMemOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(fir::FreeMemOp freeMemOp, OpAdaptor adaptor, ConversionPatternRewriter& rewriter) const override {
+      auto builder = ImplicitLocOpBuilder{freeMemOp.getLoc(), rewriter};
+      if (auto reinterpretOp = adaptor.getHeapref().getDefiningOp<memref::ReinterpretCastOp>()) {
+        if (auto allocOp = reinterpretOp.getSource().getDefiningOp<memref::AllocOp>()) {
+          auto deallocOp = builder.create<memref::DeallocOp>(allocOp.getMemref());
+          rewriter.replaceOp(freeMemOp, deallocOp);
+          return success();
+        }
+      } else if (auto allocOp = adaptor.getHeapref().getDefiningOp<memref::AllocOp>()) {
+          auto deallocOp = builder.create<memref::DeallocOp>(allocOp.getMemref());
+          rewriter.replaceOp(freeMemOp, deallocOp);
+          return success();
+      }
+      return failure();
+    }
+  };
+
   void runOnOperation() override {
     auto& context = getContext();
     auto target = ConversionTarget{context};
 
     target.addIllegalDialect<fir::FIROpsDialect>();
-    target.addLegalDialect<BuiltinDialect, arith::ArithDialect, scf::SCFDialect, cf::ControlFlowDialect,
-        memref::MemRefDialect, shape::ShapeDialect, LLVM::LLVMDialect>();
+    target.addLegalDialect<BuiltinDialect, arith::ArithDialect, index::IndexDialect, scf::SCFDialect, cf::ControlFlowDialect,
+        memref::MemRefDialect, shape::ShapeDialect, LLVM::LLVMDialect, math::MathDialect>();
     target.addLegalOp<func::ReturnOp, func::CallOp>();
 
     auto* op = getOperation();
@@ -794,8 +959,12 @@ struct FIRToMlirPass : public mlir::taffo::impl::FIRToMlirPassBase<FIRToMlirPass
     patternSet.add<RewriteZeroBits>(typeConverter, &context);
     patternSet.add<RewriteUnreachable>(typeConverter, &context);
     patternSet.add<RewriteNoReassoc>(typeConverter, &context);
+    patternSet.add<RewriteEmbox>(typeConverter, &context);
+    patternSet.add<RewriteBoxAddr>(typeConverter, &context);
+    patternSet.add<RewriteBoxDims>(typeConverter, &context);
+    patternSet.add<RewriteFreeMem>(typeConverter, &context);
     populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patternSet, typeConverter);
-    
+
     if (failed(applyFullConversion(op, target, std::move(patternSet)))) {
       signalPassFailure();
     }

@@ -4,6 +4,22 @@
 include "mlir/Pass/PassBase.td"
 include "flang/Optimizer/Dialect/FIRDialect.td"
 
+def FIRAllocatablesAnalysisPass
+    : Pass<"fir-allocatables-analysis", "mlir::func::FuncOp">
+{
+    let summary = "Allocatables analysis";
+
+    let description = [{
+        Analysis and forwarding of fortran heap arrays size information
+    }];
+
+    let dependentDialects = [
+        "fir::FIROpsDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::func::FuncDialect"
+    ];
+}
+
 def FIRToMlirPass
     : Pass<"fir-to-mlir">
 {
@@ -18,9 +34,12 @@ def FIRToMlirPass
         "mlir::scf::SCFDialect",
         "mlir::cf::ControlFlowDialect",
         "mlir::memref::MemRefDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::index::IndexDialect",
         "mlir::shape::ShapeDialect",
         "mlir::func::FuncDialect",
-        "mlir::LLVM::LLVMDialect"
+        "mlir::LLVM::LLVMDialect",
+        "mlir::math::MathDialect"
     ];
 }
 

@@ -1,0 +1,3 @@
+Modifications to the polybench sources:
+
+- polybench.h: added ``integer :: iargc`` to ``polybench_declare_prevent_dce_vars``

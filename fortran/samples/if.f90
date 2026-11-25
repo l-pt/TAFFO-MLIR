@@ -3,7 +3,11 @@ integer function iftest() result(rv)
         integer :: xyzzy
         xyzzy = 77
         if (xyzzy > 12) then
-                rv = 10
+                if (xyzzy > 32) then
+                        rv = 44
+                else
+                        rv = 10
+                end if
         else
                 rv = 20
         end if

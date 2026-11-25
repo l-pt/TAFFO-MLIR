@@ -4,5 +4,5 @@
 
 DIR="$( cd -P -- "$(dirname -- "$(command -v -- "$0")")" && pwd -P )"
 exec "$DIR"/../build/bin/taffo-opt \
-  --pass-pipeline='builtin.module(canonicalize,cse,fir-to-mlir)' \
+  --pass-pipeline='builtin.module(canonicalize,cse,func.func(fir-allocatables-analysis),fir-to-mlir,canonicalize,cse)' \
   "$@"

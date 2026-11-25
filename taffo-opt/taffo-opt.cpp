@@ -1,4 +1,5 @@
 #include "flang/Optimizer/Dialect/FIRDialect.h"
+#include "flang/Optimizer/Passes/Pipelines.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/InitAllDialects.h"
@@ -24,6 +25,7 @@ int main(int argc, char **argv) {
   registry.insert<fir::FIROpsDialect>();
 
   mlir::taffo::registerTaffoPasses();
+  fir::registerExternalNameConversionPass();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "Taffo optimizer driver\n", registry));

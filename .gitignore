@@ -5,3 +5,7 @@ compile_commands.json
 .vscode
 
 fortran/samples/program*.mlir
+fortran/test/polybench/**/*.preproc.*
+fortran/test/polybench/**/*.out
+fortran/test/polybench/**/*.out*
+fortran/test/polybench/**/*.o

@@ -7,6 +7,7 @@ call init_array(m, matrix)
 call print_array(m, matrix)
 
 print *, matrix(1, 3)
+print *, "Test"
 
 contains
     subroutine print_array(m, mat)
