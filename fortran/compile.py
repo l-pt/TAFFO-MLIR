@@ -11,12 +11,17 @@ from dataclasses import dataclass
 
 @dataclass
 class State:
+    # positional args
     infile: pathlib.Path
     outfile: pathlib.Path
+    # env
     llvm_path: pathlib.Path
     taffo_opt_path: pathlib.Path
+    # options
     object_file_path: pathlib.Path
     debug: bool
+    taffo: bool
+    verbose: bool
     # tempfiles
     fir_fp: tempfile.NamedTemporaryFile
     fir_path: pathlib.Path
@@ -29,9 +34,15 @@ class State:
     obj_fp: tempfile.NamedTemporaryFile
     obj_path: pathlib.Path
 
+def print_verbose(verbose, *args, **kwargs):
+    if verbose:
+        print(*args, **kwargs)
+
 def get_args():
     parser = argparse.ArgumentParser(prog = 'compile.py', description = 'Compile a fortran program with taffo-opt and produce an executable file')
     parser.add_argument('-d', action='store_true')
+    parser.add_argument('-t', action='store_true')
+    parser.add_argument('-v', action='store_true')
     parser.add_argument('-l', type=pathlib.Path)
     parser.add_argument('infile', type=pathlib.Path)
     parser.add_argument('outfile', nargs='?', type=pathlib.Path)
@@ -45,7 +56,7 @@ def fortran_to_fir(state):
         str(state.infile),
         '-o', str(state.fir_path)
     ]
-    print('running', argv)
+    print_verbose(state.verbose, 'running', argv)
     completed = subprocess.run(argv)
     return completed.returncode
 
@@ -58,9 +69,14 @@ def fir_to_mlir(state):
         'fir-to-mlir',
         'canonicalize',
         'cse',
-        # 'raise-to-taffo',
-        # 'value-range-analysis',
-        # 'lower-to-arith',
+    ]
+    if state.taffo:
+        passes += [
+            'raise-to-taffo',
+            'value-range-analysis',
+            'lower-to-arith',
+        ]
+    passes += [
         'loop-invariant-code-motion',
         'convert-linalg-to-loops',
         'convert-scf-to-cf',
@@ -77,12 +93,13 @@ def fir_to_mlir(state):
     argv = [
         str(state.taffo_opt_path),
         passes_arg,
+        '--vra-mode=interval',
         str(state.fir_path),
     ]
     if state.debug:
         argv += ['--debug']
     argv += ['-o', str(state.mlir_path)]
-    print('running', argv)
+    print_verbose(state.verbose, 'running', argv)
     completed = subprocess.run(argv)
     return completed.returncode
 
@@ -93,7 +110,7 @@ def mlir_to_llvmir(state):
         str(state.mlir_path),
         '-o', str(state.llvmir_path)
     ]
-    print('running', argv)
+    print_verbose(state.verbose, 'running', argv)
     completed = subprocess.run(argv)
     return completed.returncode
 
@@ -104,7 +121,7 @@ def opt_llvmir(state):
         str(state.llvmir_path),
         '-o', str(state.llvmir_opt_path)
     ]
-    print('running', argv)
+    print_verbose(state.verbose, 'running', argv)
     completed = subprocess.run(argv)
     return completed.returncode
 
@@ -119,7 +136,7 @@ def llvmir_to_asm(state):
     argv += [
         '-o', str(state.obj_path)
     ]
-    print('running', argv)
+    print_verbose(state.verbose, 'running', argv)
     completed = subprocess.run(argv)
     return completed.returncode
 
@@ -127,11 +144,11 @@ def asm_to_exe(state):
     argv = [str(state.llvm_path / 'bin' / 'flang'), '-o', str(state.outfile), str(state.obj_path)]
     if state.object_file_path is not None:
         argv += [str(state.object_file_path)]
-    print('running', argv)
+    print_verbose(state.verbose, 'running', argv)
     completed = subprocess.run(argv)
     return completed.returncode
 
-def main(): 
+def main():
     args = get_args()
 
     infile = args.infile
@@ -167,6 +184,8 @@ def main():
         pathlib.Path(taffo_opt_path),
         args.l,
         args.d,
+        args.t,
+        args.v,
         fir_fp,
         pathlib.Path(fir_fp.name),
         mlir_fp,
@@ -179,22 +198,28 @@ def main():
         pathlib.Path(obj_fp.name),
     )
     if (e := fortran_to_fir(state)) != 0:
+        print('fortran_to_fir failed')
         return e
     if (e := fir_to_mlir(state)) != 0:
+        print('fir_to_mlir failed')
         print('File contents:')
         print(state.fir_fp.read().decode())
         return e
     if (e := mlir_to_llvmir(state)) != 0:
+        print('mlir_to_llvmir failed')
         print('File contents:')
         print(state.mlir_fp.read().decode())
         return e
     if (e := opt_llvmir(state)) != 0:
+        print('opt_llvmir failed')
         print('File contents:')
         print(state.llvmir_fp.read().decode())
         return e
     if (e := llvmir_to_asm(state)) != 0:
+        print('llvmir_to_asm failed')
         return e
     if (e := asm_to_exe(state)) != 0:
+        print('asm_to_exe failed')
         return e
 
 if __name__ == '__main__':
